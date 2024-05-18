@@ -1,118 +1,172 @@
-import time
+"""
+Micropython port by Ned Konz of Bruno-Pier (BrunoB81HK)'s Python NAU7802 library,
+(https://github.com/BrunoB81HK/PyNAU7802)
+which was itself a port of the SparkFun Qwiic Scale NAU7802 Arduino library.
+"""
 
-import smbus2
+from time import sleep_ms, ticks_ms, ticks_diff
+from struct import unpack
+from micropython import const
+from machine import I2C
 
-from .constants import *
+from .constants import (
+    NAU7802_LDO_3V3,
+    NAU7802_GAIN_128,
+    NAU7802_SPS_80,
+    NAU7802_ADC,
+    NAU7802_PGA_PWR_PGA_CAP_EN,
+    NAU7802_PGA_PWR,
+    NAU7802_PU_CTRL_CR,
+    NAU7802_PU_CTRL,
+    NAU7802_ADCO_B2,
+    NAU7802_CTRL1,
+    NAU7802_CTRL2,
+    NAU7802_CHANNEL_1,
+    NAU7802_CTRL2_CHS,
+    NAU7802_CTRL2_CALS,
+    NAU7802_CTRL2_CAL_ERROR,
+    NAU7802_PU_CTRL_RR,
+    NAU7802_PU_CTRL_PUD,
+    NAU7802_PU_CTRL_PUA,
+    NAU7802_PU_CTRL_PUR,
+    NAU7802_PU_CTRL_AVDDS,
+    NAU7802_CTRL1_CRP,
+    NAU7802_CAL_IN_PROGRESS,
+    NAU7802_CAL_FAILURE,
+    NAU7802_CAL_SUCCESS,
+    NAU7802_DEVICE_REV,
+)
+
+_DEVICE_ADDRESS = const(0x2A)
+
 
 ###########################################
 # Classes
 ###########################################
 class NAU7802:
-    """ Class to communicate with the NAU7802 """
-    _i2cPort: smbus2.SMBus = None
-    _zeroOffset: int = 0
-    _calibrationFactor: float = 1.0
+    """Class to communicate with the NAU7802"""
 
-    def begin(self, wire_port: smbus2.SMBus = smbus2.SMBus(1), initialize: bool = True) -> bool:
-        """ Check communication and initialize sensor """
-        # Get user's options
+    def __init__(self, wire_port: I2C):
         self._i2cPort = wire_port
+        self._zeroOffset = 0
+        self._calibrationFactor = 1.0
+        self._registerBuffer = bytearray(1)  # for reading/writing single byte registers
+        # for unpacking 32-bit values (last byte stays 0)
+        self._valueBuffer = bytearray(4)
+        # for reading 24 bit values into 32-bit buffer
+        self._valueView = memoryview(self._valueBuffer[:3])
 
-        # Check if the device ACK's over I2C
-        if not self.isConnected():
-            # There are rare times when the sensor is occupied and doesn't ACK. A 2nd try resolves this.
+    def initialize(self) -> bool:
+        """Check communication and initialize sensor"""
+        # Check if the device ACKs over I2C
+        try:
             if not self.isConnected():
+                return False
+        except OSError:
+            # There are rare times when the sensor is occupied and doesn't ACK. A 2nd try resolves this.
+            try:
+                if not self.isConnected():
+                    return False
+            except OSError:
                 return False
 
         result = True  # Accumulate a result as we do the setup
 
-        if initialize:
+        try:
             result &= self.reset()  # Reset all registers
-            result &= self.powerUp()  # Power on analog and digital sections of the scale
+            # Power on analog and digital sections of the scale
+            result &= self.powerUp()
             result &= self.setLDO(NAU7802_LDO_3V3)  # Set LDO to 3.3V
             result &= self.setGain(NAU7802_GAIN_128)  # Set gain to 128
             result &= self.setSampleRate(NAU7802_SPS_80)  # Set samples per second to 10
-            result &= self.setRegister(NAU7802_ADC, 0x30)  # Turn off CLK_CHP. From 9.1 power on sequencing.
-            result &= self.setBit(NAU7802_PGA_PWR_PGA_CAP_EN, NAU7802_PGA_PWR)  # Enable 330pF decoupling cap on ch. 2.
+            # Turn off CLK_CHP. From 9.1 power on sequencing.
+            result &= self.setRegister(NAU7802_ADC, 0x30)
+            # Enable 330pF decoupling cap on ch. 2.
             # From 9.14 application circuit note.
-            result &= self.calibrateAFE()  # Re - cal analog frontend when we change gain, sample rate, or channel
+            result &= self.setBit(NAU7802_PGA_PWR_PGA_CAP_EN, NAU7802_PGA_PWR)
+            # Re-cal analog frontend when we change gain, sample rate, or channel
+            result &= self.calibrateAFE()
+
+        except OSError:
+            result = False
 
         return result
 
     def isConnected(self) -> bool:
-        """ Returns true if device ACK's at the I2C address """
-        try:
-            self._i2cPort.read_byte(DEVICE_ADDRESS)
-            return True  # All good
-        except OSError:
-            return False  # Sensor did not ACK
+        """Returns true if device ACKs at the I2C address"""
+        return self.getRevisionCode() == 0x0F
 
     def available(self) -> bool:
-        """ Returns true if Cycle Ready bit is set (conversion is complete) """
+        """Returns true if Cycle Ready bit is set (conversion is complete)"""
         return self.getBit(NAU7802_PU_CTRL_CR, NAU7802_PU_CTRL)
 
     def getReading(self) -> int:
-        """ Returns 24 bit reading. Assumes CR Cycle Ready bit
-        (ADC conversion complete) has been checked by .available() """
-        try:
-            value_list = self._i2cPort.read_i2c_block_data(DEVICE_ADDRESS, NAU7802_ADCO_B2, 3)
-        except OSError:
-            return False  # Sensor did not ACK
+        """Returns 24 bit reading. Assumes CR Cycle Ready bit
+        (ADC conversion complete) has been checked by .available()"""
+        self._i2cPort.readfrom_mem_into(
+            _DEVICE_ADDRESS, NAU7802_ADCO_B2, self._valueView
+        )
+        value = unpack(">l", self._valueBuffer)[0]  # big-endian signed long
+        return value >> 8  # scale down to 24 bits
 
-        value = int.from_bytes(value_list, byteorder='big', signed=True)
-
-        return value
-
-    def getAverage(self, average_amount: int) -> int:
-        """ Return the average of a given number of readings """
+    def getAverage(self, num_averaged: int) -> int:
+        """Return the average of a given number of readings"""
         total = 0
         samples_acquired = 0
 
-        start_time = time.time()
+        start_time = ticks_ms()
 
-        while samples_acquired < average_amount:
+        while samples_acquired < num_averaged:
             if self.available():
                 total += self.getReading()
                 samples_acquired += 1
 
-            if time.time() - start_time > 1.0:
+            if ticks_diff(ticks_ms(), start_time) > 1000:
                 return 0  # Timeout - Bail with error
 
-            time.sleep(0.001)
+            sleep_ms(1)
 
-        total /= average_amount
+        total /= num_averaged
 
         return total
 
-    def calculateZeroOffset(self, average_amount: int = 8) -> None:
-        """ Also called taring. Call this with nothing on the scale """
-        self.setZeroOffset(self.getAverage(average_amount))
-
-    def setZeroOffset(self, new_zero_offset: int) -> None:
-        """ Sets the internal variable. Useful for users who are loading values from NVM. """
-        self._zeroOffset = new_zero_offset
-
-    def getZeroOffset(self) -> int:
-        """ Ask library for this value.Useful for storing value into NVM. """
+    @property
+    def zeroOffset(self) -> int:
+        """Ask library for this value.Useful for storing value into NVM."""
         return self._zeroOffset
 
-    def calculateCalibrationFactor(self, weight_on_scale: float, average_amount: int = 8) -> None:
-        """ Call this with the value of the thing on the scale.
-        Sets the calibration factor based on the weight on scale and zero offset. """
-        onScale = self.getAverage(average_amount)
-        newCalFactor = (onScale - self._zeroOffset)/weight_on_scale
-        self.setCalibrationFactor(newCalFactor)
+    @zeroOffset.setter
+    def zeroOffset(self, new_zero_offset: int) -> None:
+        """Sets the internal variable. Useful for users who are loading values from NVM."""
+        self._zeroOffset = new_zero_offset
 
-    def setCalibrationFactor(self, new_cal_factor: float) -> None:
-        """ Pass a known calibration factor into library.Helpful if users is loading settings from NVM. """
-        self._calibrationFactor = new_cal_factor
+    def calculateZeroOffset(self, num_averaged: int = 8) -> None:
+        """Also called taring. Call this with nothing on the scale"""
+        self.zeroOffset = self.getAverage(num_averaged)
 
-    def getCalibrationFactor(self) -> float:
-        """ Ask library for this value.Useful for storing value into NVM. """
+    @property
+    def calibrationFactor(self) -> float:
+        """Ask library for this value.Useful for storing value into NVM."""
         return self._calibrationFactor
 
-    def getWeight(self, allow_negative_weights: bool = True, samples_to_take: int = 8) -> float:
-        """ Once you 've set zero offset and cal factor, you can ask the library to do the calculations for you. """
+    @calibrationFactor.setter
+    def calibrationFactor(self, new_cal_factor: float) -> None:
+        """Pass a known calibration factor into library.Helpful if users is loading settings from NVM."""
+        self._calibrationFactor = new_cal_factor
+
+    def calculateCalibrationFactor(
+        self, weight_on_scale: float, average_amount: int = 8
+    ) -> None:
+        """Call this with the value of the thing on the scale.
+        Sets the calibration factor based on the weight on scale and zero offset."""
+        onScale = self.getAverage(average_amount)
+        newCalFactor = (onScale - self._zeroOffset) / weight_on_scale
+        self.calibrationFactor = newCalFactor
+
+    def getWeight(
+        self, allow_negative_weights: bool = True, samples_to_take: int = 8
+    ) -> float:
+        """Once you 've set zero offset and cal factor, you can ask the library to do the calculations for you."""
         on_scale = self.getAverage(samples_to_take)
 
         # Prevent the current reading from being less than zero offset. This happens when the scale
@@ -123,11 +177,11 @@ class NAU7802:
             if on_scale < self._zeroOffset:
                 on_scale = self._zeroOffset  # Force reading to zero
 
-        weight = (on_scale - self._zeroOffset)/self._calibrationFactor
+        weight = (on_scale - self._zeroOffset) / self._calibrationFactor
         return weight
 
     def setGain(self, gain_value: int) -> bool:
-        """ Set the gain.x1, 2, 4, 8, 16, 32, 64, 128 are available """
+        """Set the gain.x1, 2, 4, 8, 16, 32, 64, 128 are available"""
         if gain_value > 0b111:
             gain_value = 0b111  # Error check
 
@@ -138,8 +192,8 @@ class NAU7802:
         return self.setRegister(NAU7802_CTRL1, value)
 
     def setLDO(self, ldo_value: int) -> bool:
-        """ Set the on board Low - Drop - Out voltage regulator to a given value.
-        2.4, 2.7, 3.0, 3.3, 3.6, 3.9, 4.2, 4.5 V are available """
+        """Set the on board Low - Drop - Out voltage regulator to a given value.
+        2.4, 2.7, 3.0, 3.3, 3.6, 3.9, 4.2, 4.5 V are available"""
         if ldo_value > 0b111:
             ldo_value = 0b111  # Error check
 
@@ -149,10 +203,12 @@ class NAU7802:
         value |= ldo_value << 3  # Mask in new LDO bits
         self.setRegister(NAU7802_CTRL1, value)
 
-        return self.setBit(NAU7802_PU_CTRL_AVDDS, NAU7802_PU_CTRL)  # Enable the internal LDO
+        return self.setBit(
+            NAU7802_PU_CTRL_AVDDS, NAU7802_PU_CTRL
+        )  # Enable the internal LDO
 
     def setSampleRate(self, rate: int) -> bool:
-        """ Set the readings per second. 10, 20, 40, 80, and 320 samples per second is available """
+        """Set the readings per second. 10, 20, 40, 80, and 320 samples per second is available"""
         if rate > 0b111:
             rate = 0b111  # Error check
 
@@ -163,33 +219,34 @@ class NAU7802:
         return self.setRegister(NAU7802_CTRL2, value)
 
     def setChannel(self, channel_number: int) -> bool:
-        """ Select between 1 and 2 """
+        """Select between 1 and 2"""
         if channel_number == NAU7802_CHANNEL_1:
-            return self.clearBit(NAU7802_CTRL2_CHS, NAU7802_CTRL2)  # Channel 1 (default)
+            return self.clearBit(
+                NAU7802_CTRL2_CHS, NAU7802_CTRL2
+            )  # Channel 1 (default)
         else:
             return self.setBit(NAU7802_CTRL2_CHS, NAU7802_CTRL2)  # Channel 2
 
     def calibrateAFE(self) -> bool:
-        """ Synchronous calibration of the analog front end of the NAU7802.
-        Returns true if CAL_ERR bit is 0 (no error) """
+        """Synchronous calibration of the analog front end of the NAU7802.
+        Returns true if CAL_ERR bit is 0 (no error)"""
         self.beginCalibrateAFE()
         return self.waitForCalibrateAFE(1000)
 
     def beginCalibrateAFE(self) -> None:
-        """ Begin asynchronous calibration of the analog front end of the NAU7802.
-        Poll for completion with calAFEStatus() or wait with waitForCalibrateAFE(). """
+        """Begin asynchronous calibration of the analog front end of the NAU7802.
+        Poll for completion with calAFEStatus() or wait with waitForCalibrateAFE()."""
         self.setBit(NAU7802_CTRL2_CALS, NAU7802_CTRL2)
 
     def waitForCalibrateAFE(self, timeout_ms: int = 0) -> bool:
-        """ Wait for asynchronous AFE calibration to complete with optional timeout. """
-        timeout_s = timeout_ms/1000
-        begin = time.time()
+        """Wait for asynchronous AFE calibration to complete with optional timeout."""
+        begin = ticks_ms()
         cal_ready = self.calAFEStatus()
 
         while cal_ready == NAU7802_CAL_IN_PROGRESS:
-            if (timeout_ms > 0) & ((time.time() - begin) > timeout_s):
+            if (timeout_ms > 0) and (ticks_diff(ticks_ms(), begin) > timeout_ms):
                 break
-            time.sleep(0.001)
+            sleep_ms(1)
             cal_ready = self.calAFEStatus()
 
         if cal_ready == NAU7802_CAL_SUCCESS:
@@ -198,7 +255,7 @@ class NAU7802:
             return False
 
     def calAFEStatus(self) -> int:
-        """ Check calibration status. """
+        """Check calibration status."""
         if self.getBit(NAU7802_CTRL2_CALS, NAU7802_CTRL2):
             return NAU7802_CAL_IN_PROGRESS
 
@@ -209,20 +266,22 @@ class NAU7802:
         return NAU7802_CAL_SUCCESS
 
     def reset(self) -> bool:
-        """ Resets all registers to Power Of Defaults """
+        """Resets all registers to Power Off Defaults"""
         self.setBit(NAU7802_PU_CTRL_RR, NAU7802_PU_CTRL)  # Set RR
-        time.sleep(0.001)
-        return self.clearBit(NAU7802_PU_CTRL_RR, NAU7802_PU_CTRL)  # Clear RR to leave reset state
+        sleep_ms(1)
+        return self.clearBit(
+            NAU7802_PU_CTRL_RR, NAU7802_PU_CTRL
+        )  # Clear RR to leave reset state
 
     def powerUp(self) -> bool:
-        """ Power up digital and analog sections of scale, ~2 mA """
+        """Power up digital and analog sections of scale, ~2 mA"""
         self.setBit(NAU7802_PU_CTRL_PUD, NAU7802_PU_CTRL)
         self.setBit(NAU7802_PU_CTRL_PUA, NAU7802_PU_CTRL)
 
         # Wait for Power Up bit to be set - takes approximately 200us
         counter = 0
         while not self.getBit(NAU7802_PU_CTRL_PUR, NAU7802_PU_CTRL):
-            time.sleep(0.001)
+            sleep_ms(1)
             if counter > 100:
                 return False  # Error
             counter += 1
@@ -230,53 +289,60 @@ class NAU7802:
         return True
 
     def powerDown(self) -> bool:
-        """ Puts scale into low - power 200 nA mode """
+        """Puts scale into low - power 200 nA mode"""
         self.clearBit(NAU7802_PU_CTRL_PUD, NAU7802_PU_CTRL)
         return self.clearBit(NAU7802_PU_CTRL_PUA, NAU7802_PU_CTRL)
 
     def setIntPolarityHigh(self) -> bool:
-        """ Set Int pin to be high when data is ready(default) """
-        return self.clearBit(NAU7802_CTRL1_CRP, NAU7802_CTRL1)  # 0 = CRDY pin is high active (ready when 1)
+        """Set Int pin to be high when data is ready(default)"""
+        return self.clearBit(
+            NAU7802_CTRL1_CRP, NAU7802_CTRL1
+        )  # 0 = CRDY pin is high active (ready when 1)
 
     def setIntPolarityLow(self) -> bool:
-        """ Set Int pin to be low when data is ready """
-        return self.setBit(NAU7802_CTRL1_CRP, NAU7802_CTRL1)  # 1 = CRDY pin is low active (ready when 0)
+        """Set Int pin to be low when data is ready"""
+        return self.setBit(
+            NAU7802_CTRL1_CRP, NAU7802_CTRL1
+        )  # 1 = CRDY pin is low active (ready when 0)
 
     def getRevisionCode(self) -> int:
-        """ Get the revision code of this IC.Always 0x0F. """
+        """Get the revision code of this IC.Always 0x0F."""
         revisionCode = self.getRegister(NAU7802_DEVICE_REV)
         return revisionCode & 0x0F
 
     def setBit(self, bit_number: int, register_address: int) -> bool:
-        """ Mask & set a given bit within a register """
+        """Mask & set a given bit within a register"""
         value = self.getRegister(register_address)
-        value |= (1 << bit_number)  # Set this bit
+        value |= 1 << bit_number  # Set this bit
         return self.setRegister(register_address, value)
 
     def clearBit(self, bit_number: int, register_address: int) -> bool:
-        """ Mask & clear a given bit within a register """
+        """Mask & clear a given bit within a register"""
         value = self.getRegister(register_address)
         value &= ~(1 << bit_number)  # Set this bit
         return self.setRegister(register_address, value)
 
     def getBit(self, bit_number: int, register_address: int) -> bool:
-        """ Return a given bit within a register """
+        """Return a given bit within a register"""
         value = self.getRegister(register_address)
-        value &= (1 << bit_number)  # Clear all but this bit
+        value &= 1 << bit_number  # Clear all but this bit
         return bool(value)
 
     def getRegister(self, register_address: int) -> int:
-        """ Get contents of a register """
+        """Get contents of a register"""
         try:
-            return self._i2cPort.read_byte_data(DEVICE_ADDRESS, register_address)
+            return self._i2cPort.readfrom_mem(_DEVICE_ADDRESS, register_address, 1)
 
         except OSError:
             return -1  # Sensor did not ACK
 
     def setRegister(self, register_address: int, value: int) -> bool:
-        """ Send a given value to be written to given address.Return true if successful """
+        """Send a given value to be written to given address.Return true if successful"""
         try:
-            self._i2cPort.write_byte_data(DEVICE_ADDRESS, register_address, value)
+            self._registerBuffer[0] = value & 0xFF
+            self._i2cPort.writeto_mem(
+                _DEVICE_ADDRESS, register_address, self._registerBuffer
+            )
             return True
 
         except OSError:

@@ -4,8 +4,11 @@
 
   Translated from the Example1_BasicReadings.ino example file
   https://github.com/sparkfun/SparkFun_Qwiic_Scale_NAU7802_Arduino_Library/tree/master/examples/Example1_BasicReadings
+  
+  Simple example to read the weight from the NAU7802 with MicroPython.
 """
 
+from machine import I2C
 from PyNAU7802 import NAU7802
 
 
