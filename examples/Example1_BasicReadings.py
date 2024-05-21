@@ -29,6 +29,8 @@ def loop() -> None:
 
 
 if __name__ == "__main__":
+    i2c = I2C(0, I2C.MASTER, baudrate=100000)  # Create I2C instance
+
     myScale = NAU7802()  # Create instance of the NAU7802 class
 
     setup()
