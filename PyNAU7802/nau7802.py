@@ -10,7 +10,7 @@ from micropython import const
 from machine import I2C
 
 from .constants import (
-    NAU7802_LDO_3V3,
+    NAU7802_LDO_3V0,
     NAU7802_GAIN_128,
     NAU7802_SPS_80,
     NAU7802_ADC,
@@ -50,11 +50,12 @@ class NAU7802:
         self._i2cPort = wire_port
         self._zeroOffset = 0
         self._calibrationFactor = 1.0
-        self._registerBuffer = bytearray(1)  # for reading/writing single byte registers
+        # for reading/writing single byte registers
+        self._registerBuffer = bytearray(1)
         # for unpacking 32-bit values (last byte stays 0)
         self._valueBuffer = bytearray(4)
         # for reading 24 bit values into 32-bit buffer
-        self._valueView = memoryview(self._valueBuffer[:3])
+        self._valueView = memoryview(self._valueBuffer)
 
     def initialize(self) -> bool:
         """Check communication and initialize sensor"""
@@ -76,14 +77,16 @@ class NAU7802:
             result &= self.reset()  # Reset all registers
             # Power on analog and digital sections of the scale
             result &= self.powerUp()
-            result &= self.setLDO(NAU7802_LDO_3V3)  # Set LDO to 3.3V
+            result &= self.setLDO(NAU7802_LDO_3V0)  # Set LDO to 3.3V
             result &= self.setGain(NAU7802_GAIN_128)  # Set gain to 128
-            result &= self.setSampleRate(NAU7802_SPS_80)  # Set samples per second to 10
+            # Set samples per second to 10
+            result &= self.setSampleRate(NAU7802_SPS_80)
             # Turn off CLK_CHP. From 9.1 power on sequencing.
             result &= self.setRegister(NAU7802_ADC, 0x30)
             # Enable 330pF decoupling cap on ch. 2.
             # From 9.14 application circuit note.
             result &= self.setBit(NAU7802_PGA_PWR_PGA_CAP_EN, NAU7802_PGA_PWR)
+            self.getAverage(10)  # Clear old values
             # Re-cal analog frontend when we change gain, sample rate, or channel
             result &= self.calibrateAFE()
 
@@ -104,10 +107,10 @@ class NAU7802:
         """Returns 24 bit reading. Assumes CR Cycle Ready bit
         (ADC conversion complete) has been checked by .available()"""
         self._i2cPort.readfrom_mem_into(
-            _DEVICE_ADDRESS, NAU7802_ADCO_B2, self._valueView
+            _DEVICE_ADDRESS, NAU7802_ADCO_B2, self._valueView[1:]
         )
         value = unpack(">l", self._valueBuffer)[0]  # big-endian signed long
-        return value >> 8  # scale down to 24 bits
+        return value
 
     def getAverage(self, num_averaged: int) -> int:
         """Return the average of a given number of readings"""
@@ -126,7 +129,7 @@ class NAU7802:
 
             sleep_ms(1)
 
-        total /= num_averaged
+        total //= num_averaged
 
         return total
 
@@ -331,7 +334,9 @@ class NAU7802:
     def getRegister(self, register_address: int) -> int:
         """Get contents of a register"""
         try:
-            return self._i2cPort.readfrom_mem(_DEVICE_ADDRESS, register_address, 1)
+            data = self._i2cPort.readfrom_mem(
+                _DEVICE_ADDRESS, register_address, 1)
+            return data[0]
 
         except OSError:
             return -1  # Sensor did not ACK
