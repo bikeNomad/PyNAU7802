@@ -61,12 +61,12 @@ class NAU7802:
         """Check communication and initialize sensor"""
         # Check if the device ACKs over I2C
         try:
-            if not self.isConnected():
+            if not (self.reset() and self.powerUp() and self.isConnected()):
                 return False
         except OSError:
             # There are rare times when the sensor is occupied and doesn't ACK. A 2nd try resolves this.
             try:
-                if not self.isConnected():
+                if not (self.reset() and self.powerUp() and self.isConnected()):
                     return False
             except OSError:
                 return False
@@ -74,9 +74,9 @@ class NAU7802:
         result = True  # Accumulate a result as we do the setup
 
         try:
-            result &= self.reset()  # Reset all registers
+            # result &= self.reset()  # Reset all registers
             # Power on analog and digital sections of the scale
-            result &= self.powerUp()
+            # result &= self.powerUp()
             result &= self.setLDO(NAU7802_LDO_3V0)  # Set LDO to 3.3V
             result &= self.setGain(NAU7802_GAIN_128)  # Set gain to 128
             # Set samples per second to 10
