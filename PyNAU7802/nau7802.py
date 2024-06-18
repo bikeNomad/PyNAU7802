@@ -44,7 +44,7 @@ _DEVICE_ADDRESS = const(0x2A)
 ###########################################
 # Classes
 ###########################################
-class nau7802:
+class NAU7802:
     """Class to communicate with the NAU7802"""
 
     def __init__(self, wire_port: I2C):
